@@ -326,7 +326,6 @@ class Commands:
     def _drop_all_files(self):
         self.coder.abs_fnames = set()
         self.coder.abs_read_only_fnames = set()
-        self.coder.companion_files = set()
 
     def _clear_chat_history(self):
         self.coder.done_messages = []
@@ -1355,22 +1354,6 @@ class Commands:
             title = None
 
         report_github_issue(issue_text, title=title, confirm=False)
-
-    def cmd_companion(self, args):
-        "Start or stop the companion functionality"
-        action = args.strip().lower()
-        if action not in ["start", "stop"]:
-            self.io.tool_error("Invalid argument. Use 'start' or 'stop'.")
-            return
-
-        enabled = (action == "start")
-        if self.coder.companion:
-            self.coder.companion.set_enabled(enabled)
-            status = "enabled" if enabled else "disabled"
-            self.io.tool_output(f"Companion functionality is now {status}.")
-        else:
-            self.io.tool_error("Companion functionality is not enabled. Make sure you are running aider with/in a git repo.")
-
 
 def expand_subdir(file_path):
     if file_path.is_file():
