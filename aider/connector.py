@@ -67,9 +67,17 @@ class ConnectorInputOutput(InputOutput):
         super().__init__(**kwargs)
         self.connector = connector
 
+    def is_error_ignored(self, message):
+        if message.endswith("is already in the chat as a read-only file"):
+            return True
+        if message.endswith("is already in the chat as an editable file"):
+            return True
+
+        return False
+
     def tool_error(self, message="", strip=True):
         super().tool_error(message, strip)
-        if self.connector:
+        if self.connector and not self.is_error_ignored(message):
             wait_for_async(self.connector, self.connector.send_error_message(message))
     
     def confirm_ask(
