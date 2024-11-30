@@ -12,6 +12,20 @@ nest_asyncio.apply()
 
 confirmation_result = None
 
+def wait_for_async(connector, coroutine):
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    try:
+        task = loop.create_task(coroutine)
+        result = loop.run_until_complete(task)
+    except Exception as e:
+        connector.tool_output(f'EXCEPTION: {e}')
+    return result
+
 async def run_editor_coder_stream(architect_coder, connector):
     # Use the editor_model from the main_model if it exists, otherwise use the main_model itself
     editor_model = architect_coder.main_model.editor_model or architect_coder.main_model
@@ -53,6 +67,11 @@ class ConnectorInputOutput(InputOutput):
         super().__init__(**kwargs)
         self.connector = connector
 
+    def tool_error(self, message="", strip=True):
+        super().tool_error(message, strip)
+        if self.connector:
+            wait_for_async(self.connector, self.connector.send_error_message(message))
+    
     def confirm_ask(
             self,
             question,
@@ -175,9 +194,10 @@ class Connector:
         await self.sio.emit('message', {
             'action': 'init',
             'baseDir': self.base_dir,
-            'listenTo': ['prompt', 'add-file', 'drop-file', 'answer-question']
+            'listenTo': ['prompt', 'add-file', 'drop-file', 'answer-question', 'set-models']
         })
         await self.send_autocompletion()
+        await self.send_current_models()
 
     async def on_message(self, data):
         await self.process_message(data)
@@ -185,10 +205,6 @@ class Connector:
     async def on_disconnect(self):
         """Handle disconnection event."""
         self.coder.io.tool_output("DISCONNECTED FROM SERVER")
-
-    async def send_message(self, message):
-        """Send a message to the server."""
-        await self.sio.send(message)
 
     async def connect(self):
         """Connect to the server."""
@@ -201,6 +217,13 @@ class Connector:
     async def start(self):
         await self.connect()
         await self.wait()
+
+    async def send_error_message(self, message):
+        self.coder.io.tool_output(f"Sending error message to server... {message}")
+        await self.sio.emit('error', {
+            'message': message
+        })
+        await asyncio.sleep(0.01)
 
     async def process_message(self, message):
         """Process incoming message and return response"""
@@ -215,20 +238,6 @@ class Connector:
                 edit_format = message.get('editFormat')
                 if not prompt:
                     return
-                elif prompt == "model":
-                    self.coder = Coder.create(
-                        from_coder=self.coder,
-                        main_model=models.Model("deepseek/deepseek-coder")
-                    )
-                    for line in self.coder.get_announcements():
-                        self.coder.io.tool_output(line)
-
-                    return json.dumps({
-                        "action": "response",
-                        "content": "model switched",
-                        "finished": True,
-                        "editedFiles": [],
-                    })
 
                 self.coder.io.tool_output("> " + prompt)
                 self.coder.io.add_to_input_history(prompt)
@@ -288,6 +297,7 @@ class Connector:
                     )
 
                 await self.sio.emit('message', response_data)
+                await self.send_update_context_files()
                 return
 
             elif action == "answer-question":
@@ -299,7 +309,8 @@ class Connector:
                 if not path:
                     return
 
-                await self.add_file(path)
+                read_only = message.get('readOnly')
+                await self.add_file(path, read_only)
 
             elif action == "drop-file":
                 path = message.get('path')
@@ -307,6 +318,22 @@ class Connector:
                     return
 
                 await self.drop_file(path)
+
+            elif action == "set-models":
+                model_name = message.get('name')
+                if not model_name:
+                    return
+
+                main_model = models.Model(model_name)
+                models.sanity_check_models(self.coder.io, main_model)
+                
+                self.coder = Coder.create(
+                    from_coder=self.coder,
+                    main_model=main_model
+                )
+                for line in self.coder.get_announcements():
+                    self.coder.io.tool_output(line)
+                await self.send_current_models()
 
             else:
                 return json.dumps({
@@ -318,14 +345,19 @@ class Connector:
                 "error": str(e)
             })
 
-    async def add_file(self, path):
+    async def add_file(self, path, read_only):
         """Add a file to the coder's tracked files"""
-        self.coder.add_rel_fname(path)
+        if read_only:
+            self.coder.commands.cmd_read_only(path)
+        else:
+            self.coder.commands.cmd_add(path)
+        await self.send_update_context_files()
         await self.send_autocompletion()
 
     async def drop_file(self, path):
         """Drop a file from the coder's tracked files"""
-        self.coder.drop_rel_fname(path)
+        self.coder.commands.cmd_drop(path)
+        await self.send_update_context_files()
         await self.send_autocompletion()
 
     async def send_autocompletion(self):
@@ -349,7 +381,48 @@ class Connector:
             await self.sio.emit("message", {
                 "action": "update-autocompletion",
                 "words": words,
-                "allFiles": self.coder.get_all_relative_files()
+                "allFiles": self.coder.get_all_relative_files(),
+                "models": models.fuzzy_match_models("")
+            })
+
+    async def send_update_context_files(self):
+        if self.sio:
+            inchat_files = self.coder.get_inchat_relative_files()
+            read_only_files = [self.coder.get_rel_fname(fname) for fname in self.coder.abs_read_only_fnames]
+            
+            context_files = [
+                {"path": fname, "readOnly": False} for fname in inchat_files
+            ] + [
+                {"path": fname, "readOnly": True} for fname in read_only_files
+            ]
+            
+            await self.sio.emit("message", {
+                "action": "update-context-files",
+                "files": context_files
+            })
+
+    async def send_current_models(self):
+        if self.sio:
+            error = None
+            info = self.coder.main_model.info
+
+            if self.coder.main_model.missing_keys:
+                error = "Missing keys for the model: " + ", ".join(self.coder.main_model.missing_keys)
+            if not info:
+                error = "Model is not available. Try setting a different model."
+                possible_matches = models.fuzzy_match_models(self.coder.main_model.name)
+                if possible_matches:
+                    error += "\nDid you mean one of these?"
+                    for match in possible_matches:
+                        error += f"\n- {match}"
+
+            await self.sio.emit("message", {
+                "action": "set-models",
+                "name": self.coder.main_model.name,
+                "weakModel": self.coder.main_model.weak_model.name,
+                "maxChatHistoryTokens": self.coder.main_model.max_chat_history_tokens,
+                "info": info,
+                "error": error
             })
 
 def main():
