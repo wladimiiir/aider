@@ -94,7 +94,7 @@ cog.outl("```")
 ## Use gpt-4-0613 model for the main chat
 #4: false
 
-## Use gpt-4o-2024-08-06 model for the main chat
+## Use gpt-4o model for the main chat
 #4o: false
 
 ## Use gpt-4o-mini model for the main chat
@@ -142,8 +142,19 @@ cog.outl("```")
 ## Specify a file with context window and costs for unknown models
 #model-metadata-file: .aider.model.metadata.json
 
+## Add a model alias (can be used multiple times)
+#alias: xxx
+## Specify multiple values like this:
+#alias:
+#  - xxx
+#  - yyy
+#  - zzz
+
 ## Verify the SSL cert when connecting to models (default: True)
 #verify-ssl: true
+
+## Timeout in seconds for API calls (default: None)
+#timeout: xxx
 
 ## Specify what edit format the LLM should use (default depends on model)
 #edit-format: xxx
@@ -298,6 +309,12 @@ cog.outl("```")
 ## Skip the sanity check for the git repository (default: False)
 #skip-sanity-check-repo: false
 
+## Enable/disable watching files for ai coding comments (default: False)
+#watch-files: false
+
+## Enable automatic copy/paste of chat between aider and web UI (default: False)
+#copy-paste: false
+
 ########################
 # Fixing and committing:
 
@@ -321,14 +338,14 @@ cog.outl("```")
 ## Enable/disable automatic testing after changes (default: False)
 #auto-test: false
 
-## Run tests and fix problems found
+## Run tests, fix problems found and then exit
 #test: false
 
 ############
 # Analytics:
 
-## Enable/disable analytics for one session (default: False)
-#analytics: false
+## Enable/disable analytics for current session (default: random)
+#analytics: xxx
 
 ## Specify a file to log analytics events
 #analytics-log: xxx
@@ -369,6 +386,9 @@ cog.outl("```")
 
 ## Check for new aider versions on launch
 #check-update: true
+
+## Show release notes on first run of new version (default: None, ask user)
+#show-release-notes: xxx
 
 ## Install the latest version from the main branch
 #install-main-branch: false
@@ -421,6 +441,12 @@ cog.outl("```")
 ## Enable/disable fancy input with history and completion (default: True)
 #fancy-input: true
 
+## Enable/disable detection and offering to add URLs to chat (default: True)
+#detect-urls: true
+
+## Specify which editor to use for the /editor command
+#editor: xxx
+
 #################
 # Voice Settings:
 
@@ -429,5 +455,8 @@ cog.outl("```")
 
 ## Specify the language for voice using ISO 639-1 code (default: auto)
 #voice-language: en
+
+## Specify the input device name for voice recording
+#voice-input-device: xxx
 ```
 <!--[[[end]]]-->

@@ -13,7 +13,7 @@ import git
 
 from aider.dump import dump  # noqa: F401
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp", ".pdf"}
 
 
 class IgnorantTemporaryDirectory:
@@ -268,7 +268,8 @@ def run_install(cmd):
 
 
 class Spinner:
-    spinner_chars = itertools.cycle(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+    unicode_spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    ascii_spinner = ["|", "/", "-", "\\"]
 
     def __init__(self, text):
         self.text = text
@@ -276,6 +277,20 @@ class Spinner:
         self.last_update = 0
         self.visible = False
         self.is_tty = sys.stdout.isatty()
+        self.tested = False
+
+    def test_charset(self):
+        if self.tested:
+            return
+        self.tested = True
+        # Try unicode first, fall back to ascii if needed
+        try:
+            # Test if we can print unicode characters
+            print(self.unicode_spinner[0], end="", flush=True)
+            print("\r", end="", flush=True)
+            self.spinner_chars = itertools.cycle(self.unicode_spinner)
+        except UnicodeEncodeError:
+            self.spinner_chars = itertools.cycle(self.ascii_spinner)
 
     def step(self):
         if not self.is_tty:
@@ -293,6 +308,7 @@ class Spinner:
         if not self.visible:
             return
 
+        self.test_charset()
         print(f"\r{self.text} {next(self.spinner_chars)}\r{self.text} ", end="", flush=True)
 
     def end(self):
@@ -382,3 +398,15 @@ def printable_shell_command(cmd_list):
         return subprocess.list2cmdline(cmd_list)
     else:
         return shlex.join(cmd_list)
+
+
+def main():
+    spinner = Spinner("Running spinner...")
+    for _ in range(40):  # 40 steps * 0.25 seconds = 10 seconds
+        time.sleep(0.25)
+        spinner.step()
+    spinner.end()
+
+
+if __name__ == "__main__":
+    main()
