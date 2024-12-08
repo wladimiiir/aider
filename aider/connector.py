@@ -6,7 +6,9 @@ import socketio
 from aider import models
 from aider.coders import Coder
 from aider.io import InputOutput, AutoCompleter
+from aider.watch import FileWatcher
 from aider.main import main as cli_main
+from aider.utils import is_image_file
 import nest_asyncio
 nest_asyncio.apply()
 
@@ -14,17 +16,12 @@ confirmation_result = None
 
 def wait_for_async(connector, coroutine):
     try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    try:
-        task = loop.create_task(coroutine)
-        result = loop.run_until_complete(task)
+        task = connector.loop.create_task(coroutine)
+        result = connector.loop.run_until_complete(task)
+        return result
     except Exception as e:
-        connector.tool_output(f'EXCEPTION: {e}')
-    return result
+        connector.coder.io.tool_output(f'EXCEPTION: {e}')
+        return None
 
 async def run_editor_coder_stream(architect_coder, connector):
     # Use the editor_model from the main_model if it exists, otherwise use the main_model itself
@@ -91,7 +88,7 @@ class ConnectorInputOutput(InputOutput):
     def tool_warning(self, message="", strip=True):
         super().tool_warning(message, strip)
         if self.connector and not self.is_warning_ignored(message):
-            wait_for_async(self.connector, self.connector.send_warning_message(message))
+            wait_for_async(self.connector, self.connector.send_log_message("warning", message))
 
     def is_error_ignored(self, message):
         if message.endswith("is already in the chat as a read-only file"):
@@ -104,7 +101,7 @@ class ConnectorInputOutput(InputOutput):
     def tool_error(self, message="", strip=True):
         super().tool_error(message, strip)
         if self.connector and not self.is_error_ignored(message):
-            wait_for_async(self.connector, self.connector.send_error_message(message))
+            wait_for_async(self.connector, self.connector.send_log_message("error", message))
     
     def confirm_ask(
             self,
@@ -160,6 +157,24 @@ class ConnectorInputOutput(InputOutput):
             self.running_shell_command = False
             self.current_command = None
 
+    def interrupt_input(self):
+        async def process_changes():
+            await self.connector.run_prompt(prompt)
+            await self.connector.send_update_context_files()
+            self.connector.file_watcher.start()
+        
+        if self.connector.file_watcher:
+            prompt = self.connector.file_watcher.process_changes()
+            if prompt:
+                changed_files = ", ".join(sorted(self.connector.file_watcher.changed_files))
+                wait_for_async(self.connector, self.connector.send_log_message("info", f"Detected changes in files: {changed_files}."))
+                wait_for_async(self.connector, self.connector.send_action({
+                    "action": "response",
+                    "finished": False,
+                    "content": ""
+                }))
+                self.connector.loop.create_task(process_changes())
+
 def create_coder(connector):
     coder = cli_main(return_coder=True)
     if not isinstance(coder, Coder):
@@ -197,7 +212,7 @@ def create_coder(connector):
     return coder
 
 class Connector:
-    def __init__(self, base_dir, server_url="http://localhost:24337"):
+    def __init__(self, base_dir, watch_files=False, server_url="http://localhost:24337"):
         self.base_dir = base_dir
         self.server_url = server_url
 
@@ -206,6 +221,16 @@ class Connector:
         self.coder.stream = True
         self.coder.pretty = False
         self.running_coder = None
+        
+        if watch_files:
+            self.file_watcher = FileWatcher(self.coder)
+            self.file_watcher.start()
+
+        try:
+            self.loop = asyncio.get_event_loop()
+        except RuntimeError:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
 
         self.sio = socketio.AsyncClient()
         self._register_events()
@@ -223,18 +248,13 @@ class Connector:
         async def disconnect():
             await self.on_disconnect()
 
-    def show_usage_report_hook(self):
-        self.coder.io.tool_output(">>>> REPORT:" + str(self.running_coder.message_cost))
-        # self.running_coder.show_usage_report()
-        return
-
     async def on_connect(self):
         """Handle connection event."""
         self.coder.io.tool_output("CONNECTED TO SERVER")
         await self.send_action({
             'action': 'init',
             'baseDir': self.base_dir,
-            'listenTo': ['prompt', 'add-file', 'drop-file', 'answer-question', 'set-models']
+            'listenTo': ['prompt', 'add-file', 'drop-file', 'answer-question', 'set-models', 'run-command']
         })
         await self.send_autocompletion()
         await self.send_current_models()
@@ -263,16 +283,10 @@ class Connector:
         if with_delay:
             await asyncio.sleep(0.01)
 
-    async def send_warning_message(self, message):
-        self.coder.io.tool_output(f"Sending warning message to server... {message}")
-        await self.sio.emit('warning', {
-            'message': message
-        })
-        await asyncio.sleep(0.01)
-
-    async def send_error_message(self, message):
-        self.coder.io.tool_output(f"Sending error message to server... {message}")
-        await self.sio.emit('error', {
+    async def send_log_message(self, level, message):
+        self.coder.io.tool_output(f"Sending {level} message to server... {message}")
+        await self.sio.emit("log", {
+            'level': level,
             'message': message
         })
         await asyncio.sleep(0.01)
@@ -292,106 +306,8 @@ class Connector:
                 edit_format = message.get('editFormat')
                 if not prompt:
                     return
-
-                self.coder.io.tool_output("> " + prompt)
-                self.coder.io.add_to_input_history(prompt)
-
-                self.running_coder = self.coder
-                self.running_coder.show_usage_report = self.show_usage_report_hook
-                if edit_format:
-                    self.running_coder = Coder.create(
-                        from_coder=self.coder,
-                        edit_format=edit_format,
-                        summarize_from_coder=False
-                    )
-
-                whole_content = ""
-
-                async def run_stream_async():
-                    try:
-                        for chunk in self.running_coder.run_stream(prompt):
-                            # add small sleeps here to allow other coroutines to run
-                            await asyncio.sleep(0.01)
-                            yield chunk
-                    except Exception as e:
-                        self.coder.io.tool_error(str(e))
-
-                async for chunk in run_stream_async():
-                    whole_content += chunk
-                    await self.send_action({
-                        "action": "response",
-                        "finished": False,
-                        "content": chunk
-                    }, False)
-
-                # Send final response with complete data
-                response_data = {
-                    "action": "response",
-                    "content": whole_content,
-                    "finished": True,
-                    "editedFiles": list(self.running_coder.aider_edited_files),
-                    "usageReport": self.running_coder.usage_report
-                }
-
-                # Add commit info if there was one
-                if self.running_coder.last_aider_commit_hash:
-                    response_data.update({
-                        "commitHash": self.running_coder.last_aider_commit_hash,
-                        "commitMessage": self.running_coder.last_aider_commit_message,
-                    })
-                    # Add diff if there was a commit
-                    commits = f"{self.running_coder.last_aider_commit_hash}~1"
-                    diff = self.running_coder.repo.diff_commits(
-                        self.running_coder.pretty,
-                        commits,
-                        self.running_coder.last_aider_commit_hash,
-                    )
-                    response_data["diff"] = diff
-
-                await self.send_action(response_data)
-
-                if self.running_coder != self.coder:
-                    self.coder = Coder.create(
-                        edit_format=self.coder.edit_format,
-                        summarize_from_coder=False,
-                        from_coder=self.running_coder,
-                    )
-                await self.send_update_context_files()
-
-                # Check for reflections
-                if self.running_coder.reflected_message:
-                    current_reflection = 0
-                    while self.running_coder.reflected_message:
-                        prompt = self.running_coder.reflected_message
-
-                        # use default coder to run the reflection
-                        self.running_coder = self.coder
-                        whole_content = ""
-                        async for chunk in run_stream_async():
-                            whole_content += chunk
-                            await self.send_action({
-                                "action": "response",
-                                "reflectedMessage": prompt,
-                                "finished": False,
-                                "content": chunk
-                            }, False)
-
-                        response_data = {
-                            "action": "response",
-                            "content": whole_content,
-                            "reflected_message": prompt,
-                            "finished": True,
-                            "editedFiles": list(self.running_coder.aider_edited_files),
-                            "usageReport": self.running_coder.usage_report
-                        }
-                        await self.send_action(response_data)
-                        await self.send_update_context_files()
-                        if current_reflection >= self.coder.max_reflections:
-                            self.coder.io.tool_warning(f"Only {str(self.coder.max_reflections)} reflections allowed, stopping.")
-                            break
-                        current_reflection += 1
-
-                return
+                
+                await self.run_prompt(prompt, edit_format)
 
             elif action == "answer-question":
                 global confirmation_result
@@ -428,6 +344,19 @@ class Connector:
                     self.coder.io.tool_output(line)
                 await self.send_current_models()
 
+            elif action == "run-command":
+                command = message.get('command')
+                if not command:
+                    return
+
+                self.coder.commands.run(command)
+                if command.startswith("/paste"):
+                    await asyncio.sleep(0.1)
+                    await self.send_update_context_files()
+                elif command.startswith("/clear"):
+                    await asyncio.sleep(0.1)
+                    await self.send_tokens_info()
+
             else:
                 return json.dumps({
                     "error": f"Unknown action: {action}"
@@ -442,20 +371,123 @@ class Connector:
     def reset_before_action(self):
         self.coder.io.reset_state()
 
+    async def run_prompt(self, prompt, edit_format=None):
+        self.coder.io.add_to_input_history(prompt)
+
+        self.running_coder = self.coder
+        if edit_format:
+            self.running_coder = Coder.create(
+                from_coder=self.coder,
+                edit_format=edit_format,
+                summarize_from_coder=False
+            )
+
+        whole_content = ""
+
+        async def run_stream_async():
+            try:
+                for chunk in self.running_coder.run_stream(prompt):
+                    # add small sleeps here to allow other coroutines to run
+                    await asyncio.sleep(0.01)
+                    yield chunk
+            except Exception as e:
+                self.coder.io.tool_error(str(e))
+
+        async for chunk in run_stream_async():
+            whole_content += chunk
+            await self.send_action({
+                "action": "response",
+                "finished": False,
+                "content": chunk
+            }, False)
+
+        # Send final response with complete data
+        response_data = {
+            "action": "response",
+            "content": whole_content,
+            "finished": True,
+            "editedFiles": list(self.running_coder.aider_edited_files),
+            "usageReport": self.running_coder.usage_report
+        }
+
+        # Add commit info if there was one
+        if self.running_coder.last_aider_commit_hash:
+            response_data.update({
+                "commitHash": self.running_coder.last_aider_commit_hash,
+                "commitMessage": self.running_coder.last_aider_commit_message,
+            })
+            # Add diff if there was a commit
+            commits = f"{self.running_coder.last_aider_commit_hash}~1"
+            diff = self.running_coder.repo.diff_commits(
+                self.running_coder.pretty,
+                commits,
+                self.running_coder.last_aider_commit_hash,
+            )
+            response_data["diff"] = diff
+
+        await self.send_action(response_data)
+
+        if self.running_coder != self.coder:
+            self.coder = Coder.create(
+                edit_format=self.coder.edit_format,
+                summarize_from_coder=False,
+                from_coder=self.running_coder,
+            )
+        await self.send_update_context_files()
+
+        # Check for reflections
+        if self.running_coder.reflected_message:
+            current_reflection = 0
+            while self.running_coder.reflected_message:
+                prompt = self.running_coder.reflected_message
+
+                # use default coder to run the reflection
+                self.running_coder = self.coder
+                whole_content = ""
+                async for chunk in run_stream_async():
+                    whole_content += chunk
+                    await self.send_action({
+                        "action": "response",
+                        "reflectedMessage": prompt,
+                        "finished": False,
+                        "content": chunk
+                    }, False)
+
+                response_data = {
+                    "action": "response",
+                    "content": whole_content,
+                    "reflected_message": prompt,
+                    "finished": True,
+                    "editedFiles": list(self.running_coder.aider_edited_files),
+                    "usageReport": self.running_coder.usage_report
+                }
+                await self.send_action(response_data)
+                await self.send_update_context_files()
+                if current_reflection >= self.coder.max_reflections:
+                    self.coder.io.tool_warning(f"Only {str(self.coder.max_reflections)} reflections allowed, stopping.")
+                    break
+                current_reflection += 1
+        
+        self.running_coder = None
+        await self.send_autocompletion()
+        await self.send_tokens_info()
+
     async def add_file(self, path, read_only):
         """Add a file to the coder's tracked files"""
         if read_only:
-            self.coder.commands.cmd_read_only(path)
+            self.coder.commands.cmd_read_only("\"" + path + "\"")
         else:
-            self.coder.commands.cmd_add(path)
+            self.coder.commands.cmd_add("\"" + path + "\"")
         await self.send_update_context_files()
         await self.send_autocompletion()
+        await self.send_tokens_info()
 
     async def drop_file(self, path):
         """Drop a file from the coder's tracked files"""
-        self.coder.commands.cmd_drop(path)
+        self.coder.commands.cmd_drop("\"" + path + "\"")
         await self.send_update_context_files()
         await self.send_autocompletion()
+        await self.send_tokens_info()
 
     async def send_autocompletion(self):
         inchat_files = self.coder.get_inchat_relative_files()
@@ -498,13 +530,6 @@ class Connector:
                 "files": context_files
             })
 
-    async def send_session_info(self):
-        if self.sio:
-            await self.sio.emit("message", {
-                "action": "session-info",
-                "totalCost": self.coder.total_cost
-            })
-
     async def send_current_models(self):
         if self.sio:
             error = None
@@ -527,6 +552,92 @@ class Connector:
                 "maxChatHistoryTokens": self.coder.main_model.max_chat_history_tokens,
                 "info": info,
                 "error": error
+            })
+    
+    async def send_tokens_info(self):
+        cost_per_token = self.coder.main_model.info.get("input_cost_per_token") or 0
+        info = {
+            "files": {}
+        }
+        
+        self.coder.choose_fence()
+
+        # system messages
+        main_sys = self.coder.fmt_system_prompt(self.coder.gpt_prompts.main_system)
+        main_sys += "\n" + self.coder.fmt_system_prompt(self.coder.gpt_prompts.system_reminder)
+        msgs = [
+            dict(role="system", content=main_sys),
+            dict(
+                role="system",
+                content=self.coder.fmt_system_prompt(self.coder.gpt_prompts.system_reminder),
+            ),
+        ]
+        tokens = self.coder.main_model.token_count(msgs)
+        info["systemMessages"] = {
+            "tokens": tokens,
+            "cost": tokens * cost_per_token,
+        }
+
+        # chat history
+        msgs = self.coder.done_messages + self.coder.cur_messages
+        if msgs:
+            tokens = self.coder.main_model.token_count(msgs)
+        else:
+            tokens = 0
+        info["chatHistory"] = {
+            "tokens": tokens,
+            "cost": tokens * cost_per_token,
+        }
+
+        # repo map
+        other_files = set(self.coder.get_all_abs_files()) - set(self.coder.abs_fnames)
+        if self.coder.repo_map:
+            repo_content = self.coder.repo_map.get_repo_map(self.coder.abs_fnames, other_files)
+            if repo_content:
+                tokens = self.coder.main_model.token_count(repo_content)
+            else:
+                tokens = 0
+        else:
+            tokens = 0
+        info["repoMap"] = {
+            "tokens": tokens,
+            "cost": tokens * cost_per_token,
+        }
+
+        fence = "`" * 3
+
+        # files
+        for fname in self.coder.abs_fnames:
+            relative_fname = self.coder.get_rel_fname(fname)
+            content = self.coder.io.read_text(fname)
+            if is_image_file(relative_fname):
+                tokens = self.coder.main_model.token_count_for_image(fname)
+            else:
+                # approximate
+                content = f"{relative_fname}\n{fence}\n" + content + "{fence}\n"
+                tokens = self.coder.main_model.token_count(content)
+            info["files"][relative_fname] = {
+                "tokens": tokens,
+                "cost": tokens * cost_per_token,
+            }
+
+        # read-only files
+        for fname in self.coder.abs_read_only_fnames:
+            relative_fname = self.coder.get_rel_fname(fname)
+            content = self.coder.io.read_text(fname)
+            if content is not None and not is_image_file(relative_fname):
+                # approximate
+                content = f"{relative_fname}\n{fence}\n" + content + "{fence}\n"
+                tokens = self.coder.main_model.token_count(content)
+                info["files"][relative_fname] = {
+                    "tokens": tokens,
+                    "cost": tokens * cost_per_token,
+                }
+
+        if self.sio:
+            await self.sio.emit("message", {
+                "action": "tokens-info",
+                "info": info
             })
 
 def main():

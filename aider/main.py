@@ -208,13 +208,10 @@ def check_streamlit_install(io):
     )
 
 
-def launch_connector(base_dir):
+def launch_connector(base_dir, watch_files):
     from aider.connector import Connector
 
-    print()
-    print("CONTROL-C to exit...")
-
-    connector = Connector(base_dir)
+    connector = Connector(base_dir, watch_files)
     asyncio.run(connector.start())
 
 def launch_gui(args):
@@ -611,7 +608,7 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
                 return 1
 
     if args.connector and not return_coder:
-        launch_connector(git_dname)
+        launch_connector(git_dname, args.watch_files)
         return
 
     # We can't know the git repo for sure until after parsing the args.
