@@ -442,8 +442,10 @@ class Connector:
                 self.running_coder.last_aider_commit_hash,
             )
             response_data["diff"] = diff
-
         await self.send_action(response_data)
+
+        if self.interrupted:
+            self.running_coder.cur_messages += [dict(role="assistant", content=whole_content + " (interrupted)")]
 
         if self.running_coder != self.coder:
             self.coder = Coder.create(
@@ -484,7 +486,12 @@ class Connector:
                     "editedFiles": list(self.running_coder.aider_edited_files),
                     "usageReport": self.running_coder.usage_report
                 }
+
                 await self.send_action(response_data)
+
+                if self.interrupted:
+                    self.running_coder.cur_messages += [dict(role="assistant", content=whole_content + " (interrupted)")]
+
                 await self.send_update_context_files()
                 if current_reflection >= self.coder.max_reflections:
                     self.coder.io.tool_warning(f"Only {str(self.coder.max_reflections)} reflections allowed, stopping.")
