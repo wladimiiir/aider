@@ -83,6 +83,10 @@ class ConnectorInputOutput(InputOutput):
                     wait_for_async(self.connector, send_use_command_output())
 
     def is_warning_ignored(self, message):
+        if message == "Warning: it's best to only add files that need changes to the chat.":
+            return True
+        if message == "https://aider.chat/docs/troubleshooting/edit-errors.html":
+            return True
         return False
 
     def tool_warning(self, message="", strip=True):
@@ -221,6 +225,7 @@ class Connector:
         self.coder.stream = True
         self.coder.pretty = False
         self.running_coder = None
+        self.interrupted = False
         
         if watch_files:
             self.file_watcher = FileWatcher(self.coder)
@@ -254,7 +259,7 @@ class Connector:
         await self.send_action({
             'action': 'init',
             'baseDir': self.base_dir,
-            'listenTo': ['prompt', 'add-file', 'drop-file', 'answer-question', 'set-models', 'run-command']
+            'listenTo': ['prompt', 'add-file', 'drop-file', 'answer-question', 'set-models', 'run-command', 'add-message', 'interrupt-response']
         })
         await self.send_autocompletion()
         await self.send_current_models()
@@ -349,13 +354,22 @@ class Connector:
                 if not command:
                     return
 
-                self.coder.commands.run(command)
-                if command.startswith("/paste"):
-                    await asyncio.sleep(0.1)
-                    await self.send_update_context_files()
-                elif command.startswith("/clear"):
-                    await asyncio.sleep(0.1)
-                    await self.send_tokens_info()
+                await self.run_command(command)
+
+            elif action == "add-message":
+                content = message.get('content')
+                if not content:
+                    return
+                
+                self.coder.cur_messages += [
+                    dict(role="user", content=content),
+                    dict(role="assistant", content="Ok."),
+                ]
+                await self.send_tokens_info()
+
+            elif action == "interrupt-response":
+                self.interrupted = True
+                self.coder.io.tool_output("INTERRUPTING RESPONSE")
 
             else:
                 return json.dumps({
@@ -370,6 +384,7 @@ class Connector:
         
     def reset_before_action(self):
         self.coder.io.reset_state()
+        self.interrupted = False
 
     async def run_prompt(self, prompt, edit_format=None):
         self.coder.io.add_to_input_history(prompt)
@@ -389,7 +404,10 @@ class Connector:
                 for chunk in self.running_coder.run_stream(prompt):
                     # add small sleeps here to allow other coroutines to run
                     await asyncio.sleep(0.01)
-                    yield chunk
+                    if self.interrupted:
+                        break
+                    else:
+                        yield chunk
             except Exception as e:
                 self.coder.io.tool_error(str(e))
 
@@ -438,8 +456,13 @@ class Connector:
         # Check for reflections
         if self.running_coder.reflected_message:
             current_reflection = 0
-            while self.running_coder.reflected_message:
+            while self.running_coder.reflected_message and not self.interrupted:
                 prompt = self.running_coder.reflected_message
+                await self.send_action({
+                    "action": "response",
+                    "finished": False,
+                    "content": ""
+                })
 
                 # use default coder to run the reflection
                 self.running_coder = self.coder
@@ -488,6 +511,18 @@ class Connector:
         await self.send_update_context_files()
         await self.send_autocompletion()
         await self.send_tokens_info()
+
+    async def run_command(self, command):
+        self.coder.commands.run(command)
+        if command.startswith("/paste"):
+            await asyncio.sleep(0.1)
+            await self.send_update_context_files()
+        elif command.startswith("/clear"):
+            await asyncio.sleep(0.1)
+            await self.send_tokens_info()
+        elif command.startswith("/map-refresh"):
+            await asyncio.sleep(0.1)
+            await self.send_autocompletion()
 
     async def send_autocompletion(self):
         inchat_files = self.coder.get_inchat_relative_files()
