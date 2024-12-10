@@ -259,7 +259,17 @@ class Connector:
         await self.send_action({
             'action': 'init',
             'baseDir': self.base_dir,
-            'listenTo': ['prompt', 'add-file', 'drop-file', 'answer-question', 'set-models', 'run-command', 'add-message', 'interrupt-response']
+            'listenTo': [
+                'prompt', 
+                'add-file', 
+                'drop-file', 
+                'answer-question', 
+                'set-models', 
+                'run-command', 
+                'add-message', 
+                'interrupt-response',
+                'apply-edits'
+            ]
         })
         await self.send_autocompletion()
         await self.send_current_models()
@@ -348,6 +358,7 @@ class Connector:
                 for line in self.coder.get_announcements():
                     self.coder.io.tool_output(line)
                 await self.send_current_models()
+                await self.send_tokens_info()
 
             elif action == "run-command":
                 command = message.get('command')
@@ -370,6 +381,18 @@ class Connector:
             elif action == "interrupt-response":
                 self.interrupted = True
                 self.coder.io.tool_output("INTERRUPTING RESPONSE")
+
+            elif action == "apply-edits":
+                edits = message.get('edits')
+                if not edits:
+                    return
+
+                edit_tuples = [(edit['path'], edit['original'], edit['updated']) for edit in edits]
+                await self.send_log_message("loading", "Applying changes...")
+                self.coder.apply_edits(edit_tuples)
+                await self.send_log_message("info", "Files have been updated." if len(edits) > 1 else "File has been updated.")
+                await self.send_update_context_files()
+                await self.send_tokens_info()
 
             else:
                 return json.dumps({
